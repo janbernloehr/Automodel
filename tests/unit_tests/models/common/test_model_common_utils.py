@@ -13,13 +13,15 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 import torch
 from torch import nn
 
+from nemo_automodel.components.config.loader import load_yaml_config
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
@@ -38,6 +40,68 @@ from nemo_automodel.components.models.common.utils import (
 
 
 class TestQuackBackend:
+    def test_deepep_benchmark_selects_untuned_linear(self):
+        root = Path(__file__).resolve().parents[4]
+        recipe = load_yaml_config(root / "examples/llm_benchmark/qwen/qwen3_moe_30b_quack_deepep.yaml")
+        backend = recipe.model.backend.instantiate()
+        kernel = Mock()
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from", return_value=(True, kernel)
+        ):
+            module = initialize_linear_module(backend.linear, 8, 16, device="cpu", dtype=torch.float32)
+        x = torch.randn(2, 8)
+        with patch.object(torch.Tensor, "is_cuda", new_callable=PropertyMock, return_value=True):
+            assert module(x) is kernel.return_value
+        kernel.assert_called_once_with(x, module.weight, None, tuned=False)
+
+    @pytest.mark.parametrize("bias", [False, True])
+    @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 3, 8)])
+    def test_untuned_cpu_matches_torch_forward_backward(self, bias, shape):
+        torch.manual_seed(42)
+        kernel = Mock(side_effect=AssertionError("CPU fallback must not call QuACK"))
+        reference = nn.Linear(8, 16, bias=bias, dtype=torch.float32)
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from", return_value=(True, kernel)
+        ):
+            module = initialize_linear_module("quack_untuned", 8, 16, bias=bias, device="meta", dtype=torch.float32)
+        module.to_empty(device="cpu")
+        module.load_state_dict(reference.state_dict())
+        assert isinstance(module, nn.Linear)
+        assert set(module.state_dict()) == set(reference.state_dict())
+
+        x = torch.randn(shape, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        output, expected = module(x), reference(x_ref)
+        grad = torch.randn_like(output)
+        output.backward(grad)
+        expected.backward(grad)
+
+        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        for actual, ref in zip(module.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, ref.grad)
+        kernel.assert_not_called()
+
+    @pytest.mark.parametrize("in_features,out_features", [(8, 16), (7, 16), (8, 15)])
+    def test_untuned_cuda_dispatch_and_alignment_fallback(self, in_features, out_features):
+        kernel = Mock()
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from", return_value=(True, kernel)
+        ):
+            module = initialize_linear_module(
+                "quack_untuned", in_features, out_features, bias=True, device="cpu", dtype=torch.float32
+            )
+        x = torch.randn(2, 3, in_features)
+        with patch.object(torch.Tensor, "is_cuda", new_callable=PropertyMock, return_value=True):
+            output = module(x)
+
+        if in_features == 8 and out_features == 16:
+            assert output is kernel.return_value
+            kernel.assert_called_once_with(x, module.weight, module.bias, tuned=False)
+        else:
+            kernel.assert_not_called()
+            torch.testing.assert_close(output, nn.functional.linear(x, module.weight, module.bias))
+
     def test_quack_linear_preserves_linear_contract(self):
         class FakeQuackLinear(nn.Linear):
             pass
@@ -70,6 +134,7 @@ class TestQuackBackend:
         ("initializer", "args", "match"),
         [
             (initialize_linear_module, ("quack", 8, 16), "linear='quack'"),
+            (initialize_linear_module, ("quack_untuned", 8, 16), "linear='quack_untuned'"),
             (initialize_rms_norm_module, ("quack", 8), "rms_norm='quack'"),
         ],
     )

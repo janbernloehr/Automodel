@@ -432,7 +432,10 @@ class BackendConfig:
         sparse_attn: Sparse-attention backend. "generic" preserves each model's
             existing sparse mask plus ``attn`` path; "msa" selects the optional
             SM100 MSA kernels a model provides for its sparse layers only.
-        linear: Linear layer backend ("torch", "te", or "quack").
+        linear: Linear layer backend ("torch", "te", "quack", or "quack_untuned").
+            "quack_untuned" uses QuACK's default GEMM configurations for forward
+            and backward, avoiding cold-cache autotuning. "quack" retains
+            autotuning for workloads that can amortize its startup cost.
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch", "quack" or "triton"). QuACK is currently
             integrated for Llama-family rotary embeddings; "triton" selects the fused
@@ -515,7 +518,9 @@ class BackendConfig:
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     sparse_attn: Literal["generic", "msa"] = "generic"
-    linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    linear: Literal["torch", "te", "quack", "quack_untuned"] = (
+        "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    )
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack", "triton"] = "torch"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
@@ -879,6 +884,46 @@ def initialize_rms_norm_module(
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
 
+class _UntunedQuackLinear(nn.Linear):
+    """Linear using QuACK's default GEMM configurations without autotuning."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool,
+        device: torch.device | str | None,
+        dtype: torch.dtype,
+    ) -> None:
+        available, linear_func = safe_import_from(
+            "quack.linear",
+            "linear_func",
+            msg="linear='quack_untuned' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+        )
+        if not available:
+            raise ImportError(
+                "linear='quack_untuned' requires the 'quack-kernels' package. Install nemo-automodel[cuda]."
+            )
+        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
+        self._linear_func = linear_func
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Apply the linear projection without a GEMM autotuning search.
+
+        Args:
+            input: Tensor of shape [..., in_features], with arbitrary leading
+                dimensions. CUDA inputs with at least two dimensions and feature
+                sizes divisible by eight use QuACK; other inputs use PyTorch.
+
+        Returns:
+            Tensor of shape [..., out_features], preserving the leading dimensions.
+        """
+        if input.is_cuda and input.ndim >= 2 and self.in_features % 8 == 0 and self.out_features % 8 == 0:
+            return self._linear_func(input, self.weight, self.bias, tuned=False)
+        return nn.functional.linear(input, self.weight, self.bias)
+
+
 def initialize_linear_module(
     linear_impl: str,
     in_features: int,
@@ -893,7 +938,8 @@ def initialize_linear_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        linear_impl: Backend implementation ("te", "torch", or "quack")
+        linear_impl: Backend implementation ("te", "torch", "quack", or "quack_untuned").
+            "quack_untuned" skips forward and backward GEMM autotuning.
         in_features: Input features
         out_features: Output features
         bias: Whether to use bias
@@ -913,6 +959,8 @@ def initialize_linear_module(
         return TransformerEngineLinear(
             in_features=in_features, out_features=out_features, bias=bias, device=device, params_dtype=dtype
         )
+    elif linear_impl == "quack_untuned":
+        return _UntunedQuackLinear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     elif linear_impl == "quack":
         available, quack_linear = safe_import_from(
             "quack.linear",

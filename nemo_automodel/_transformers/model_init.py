@@ -1530,9 +1530,9 @@ def _apply_backend_module_overrides(model: torch.nn.Module, backend: BackendConf
                 continue
 
             replacement = replacements.get(id(child))
-            if replacement is None and backend.linear == "quack" and type(child) is torch.nn.Linear:
+            if replacement is None and backend.linear in ("quack", "quack_untuned") and type(child) is torch.nn.Linear:
                 replacement = initialize_linear_module(
-                    "quack",
+                    backend.linear,
                     child.in_features,
                     child.out_features,
                     bias=child.bias is not None,

@@ -45,6 +45,35 @@ from nemo_automodel.components.models.common.utils import BackendConfig, generat
 
 
 class TestBackendModuleOverrides:
+    def test_untuned_quack_preserves_shared_parameters_and_forward_backward(self):
+        torch.manual_seed(42)
+        model = nn.Module()
+        model.projection = nn.Linear(8, 16, bias=True)
+        model.projection_alias = model.projection
+        model.tied = nn.Linear(8, 16, bias=False)
+        model.tied.weight = model.projection.weight
+        model.eval()
+        original = model.projection
+        kernel = MagicMock(side_effect=AssertionError("CPU fallback must not call QuACK"))
+        backend = BackendConfig(linear="quack_untuned")
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from", return_value=(True, kernel)
+        ):
+            _apply_backend_module_overrides(model, backend)
+
+        assert model.projection is not original
+        assert model.projection_alias is model.projection
+        assert model.projection.weight is original.weight is model.tied.weight
+        assert model.projection.bias is original.bias
+        assert not model.projection.training
+        assert backend.linear == "quack_untuned"
+        x = torch.randn(2, 8, requires_grad=True)
+        torch.testing.assert_close(model.projection(x), original(x))
+        (model.projection(x) + model.tied(x)).sum().backward()
+        assert torch.isfinite(x.grad).all()
+        assert torch.isfinite(original.weight.grad).all()
+        kernel.assert_not_called()
+
     def test_quack_replaces_standard_modules_without_replacing_parameters(self):
         class FakeQuackLinear(nn.Linear):
             pass

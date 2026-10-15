@@ -14,6 +14,10 @@
 
 # Benchmarking config for Qwen3 MoE 30B with QuACK linears and RMSNorm.
 # Compare with qwen3_moe_30b_te_deepep.yaml under the same image and GPU shape.
+# Use default GEMM configurations to avoid the cold-cache autotuning cost in
+# #4353. This measures untuned QuACK throughput; first-use compilation remains.
+# For tuned throughput, override --model.backend.linear quack and allow extra
+# startup time; persist QUACK_CACHE_DIR to reuse tuning results across runs.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -67,7 +71,7 @@ model:
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
-    linear: quack
+    linear: quack_untuned
     rms_norm: quack
     rope_fusion: false
     experts: torch_mm
@@ -104,6 +108,6 @@ optimizer:
 
 ci:
   recipe_owner: akoumpa
-  # CuTe kernels compile on first use before the configured warmup iterations.
+  # CuTe kernels still compile on first use; GEMM autotuning is disabled above.
   time: "01:00:00"
   nodes: 1
